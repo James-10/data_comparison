@@ -5,6 +5,9 @@ name = "pypi"
 
 [packages]
 pandas = "~=1.5.3"
+sqlalchemy = "~=1.4.46"
+PyYAML  = "~=6.0"
+psycopg2 = "~=2.9.5"
 
 [dev-packages]
 
