@@ -7,7 +7,8 @@ name = "pypi"
 pandas = "~=1.5.3"
 sqlalchemy = "~=1.4.46"
 PyYAML  = "~=6.0"
-psycopg2 = "~=2.9.5"
+psycopg2-binary = "~=2.9.5"
+Faker = "~=16.6.0"
 
 [dev-packages]
 

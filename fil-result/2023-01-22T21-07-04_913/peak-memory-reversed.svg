@@ -1,0 +1,1493 @@
+<?xml version="1.0" standalone="no"?>
+<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">
+<svg version="1.1" width="1200" height="2172" onload="init(evt)" viewBox="0 0 1200 2172" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" xmlns:fg="http://github.com/jonhoo/inferno">
+    <!--Flame graph stack visualization. See https://github.com/brendangregg/FlameGraph for latest version, and http://www.brendangregg.com/flamegraphs.html for examples.-->
+    <!--NOTES: -->
+    <defs>
+        <linearGradient id="background" y1="0" y2="1" x1="0" x2="0">
+            <stop stop-color="#eeeeee" offset="5%"/>
+            <stop stop-color="#eeeeb0" offset="95%"/>
+        </linearGradient>
+    </defs>
+    <style type="text/css">
+text { font-family:monospace; font-size:16px }
+#title { text-anchor:middle; font-size:21px; }
+#matched { text-anchor:end; }
+#search { text-anchor:end; opacity:0.1; cursor:pointer; }
+#search:hover, #search.show { opacity:1; }
+#subtitle { text-anchor:middle; font-color:rgb(160,160,160); }
+#unzoom { cursor:pointer; }
+#frames > *:hover { stroke:black; stroke-width:0.5; cursor:pointer; }
+.hide { display:none; }
+.parent { opacity:0.5; }
+</style>
+    <script type="text/ecmascript"><![CDATA[
+        var nametype = 'Function:';
+        var fontsize = 16;
+        var fontwidth = 0.59;
+        var xpad = 10;
+        var inverted = true;
+        var searchcolor = 'rgb(230,0,230)';
+        var fluiddrawing = true;
+        var truncate_text_right = false;
+    ]]><![CDATA["use strict";
+var details, searchbtn, unzoombtn, matchedtxt, svg, searching, frames, known_font_width;
+function init(evt) {
+    details = document.getElementById("details").firstChild;
+    searchbtn = document.getElementById("search");
+    unzoombtn = document.getElementById("unzoom");
+    matchedtxt = document.getElementById("matched");
+    svg = document.getElementsByTagName("svg")[0];
+    frames = document.getElementById("frames");
+    known_font_width = get_monospace_width(frames);
+    total_samples = parseInt(frames.attributes.total_samples.value);
+    searching = 0;
+
+    // Use GET parameters to restore a flamegraph's state.
+    var restore_state = function() {
+        var params = get_params();
+        if (params.x && params.y)
+            zoom(find_group(document.querySelector('[*|x="' + params.x + '"][y="' + params.y + '"]')));
+        if (params.s)
+            search(params.s);
+    };
+
+    if (fluiddrawing) {
+        // Make width dynamic so the SVG fits its parent's width.
+        svg.removeAttribute("width");
+        // Edge requires us to have a viewBox that gets updated with size changes.
+        var isEdge = /Edge\/\d./i.test(navigator.userAgent);
+        if (!isEdge) {
+            svg.removeAttribute("viewBox");
+        }
+        var update_for_width_change = function() {
+            if (isEdge) {
+                svg.attributes.viewBox.value = "0 0 " + svg.width.baseVal.value + " " + svg.height.baseVal.value;
+            }
+
+            // Keep consistent padding on left and right of frames container.
+            frames.attributes.width.value = svg.width.baseVal.value - xpad * 2;
+
+            // Text truncation needs to be adjusted for the current width.
+            update_text_for_elements(frames.children);
+
+            // Keep search elements at a fixed distance from right edge.
+            var svgWidth = svg.width.baseVal.value;
+            searchbtn.attributes.x.value = svgWidth - xpad;
+            matchedtxt.attributes.x.value = svgWidth - xpad;
+        };
+        window.addEventListener('resize', function() {
+            update_for_width_change();
+        });
+        // This needs to be done asynchronously for Safari to work.
+        setTimeout(function() {
+            unzoom();
+            update_for_width_change();
+            restore_state();
+        }, 0);
+    } else {
+        restore_state();
+    }
+}
+// event listeners
+window.addEventListener("click", function(e) {
+    var target = find_group(e.target);
+    if (target) {
+        if (target.nodeName == "a") {
+            if (e.ctrlKey === false) return;
+            e.preventDefault();
+        }
+        if (target.classList.contains("parent")) unzoom();
+        zoom(target);
+
+        // set parameters for zoom state
+        var el = target.querySelector("rect");
+        if (el && el.attributes && el.attributes.y && el.attributes["fg:x"]) {
+            var params = get_params()
+            params.x = el.attributes["fg:x"].value;
+            params.y = el.attributes.y.value;
+            history.replaceState(null, null, parse_params(params));
+        }
+    }
+    else if (e.target.id == "unzoom") {
+        unzoom();
+
+        // remove zoom state
+        var params = get_params();
+        if (params.x) delete params.x;
+        if (params.y) delete params.y;
+        history.replaceState(null, null, parse_params(params));
+    }
+    else if (e.target.id == "search") search_prompt();
+}, false)
+// mouse-over for info
+// show
+window.addEventListener("mouseover", function(e) {
+    var target = find_group(e.target);
+    if (target) details.nodeValue = nametype + " " + g_to_text(target);
+}, false)
+// clear
+window.addEventListener("mouseout", function(e) {
+    var target = find_group(e.target);
+    if (target) details.nodeValue = ' ';
+}, false)
+// ctrl-F for search
+window.addEventListener("keydown",function (e) {
+    if (e.keyCode === 114 || (e.ctrlKey && e.keyCode === 70)) {
+        e.preventDefault();
+        search_prompt();
+    }
+}, false)
+// functions
+function get_params() {
+    var params = {};
+    var paramsarr = window.location.search.substr(1).split('&');
+    for (var i = 0; i < paramsarr.length; ++i) {
+        var tmp = paramsarr[i].split("=");
+        if (!tmp[0] || !tmp[1]) continue;
+        params[tmp[0]]  = decodeURIComponent(tmp[1]);
+    }
+    return params;
+}
+function parse_params(params) {
+    var uri = "?";
+    for (var key in params) {
+        uri += key + '=' + encodeURIComponent(params[key]) + '&';
+    }
+    if (uri.slice(-1) == "&")
+        uri = uri.substring(0, uri.length - 1);
+    if (uri == '?')
+        uri = window.location.href.split('?')[0];
+    return uri;
+}
+function find_child(node, selector) {
+    var children = node.querySelectorAll(selector);
+    if (children.length) return children[0];
+    return;
+}
+function find_group(node) {
+    var parent = node.parentElement;
+    if (!parent) return;
+    if (parent.id == "frames") return node;
+    return find_group(parent);
+}
+function orig_save(e, attr, val) {
+    if (e.attributes["fg:orig_" + attr] != undefined) return;
+    if (e.attributes[attr] == undefined) return;
+    if (val == undefined) val = e.attributes[attr].value;
+    e.setAttribute("fg:orig_" + attr, val);
+}
+function orig_load(e, attr) {
+    if (e.attributes["fg:orig_"+attr] == undefined) return;
+    e.attributes[attr].value = e.attributes["fg:orig_" + attr].value;
+    e.removeAttribute("fg:orig_" + attr);
+}
+function g_to_text(e) {
+    var text = find_child(e, "title").firstChild.nodeValue;
+    return (text)
+}
+function g_to_func(e) {
+    var func = g_to_text(e);
+    // if there's any manipulation we want to do to the function
+    // name before it's searched, do it here before returning.
+    return (func);
+}
+function get_monospace_width(frames) {
+    // Given the id="frames" element, return the width of text characters if
+    // this is a monospace font, otherwise return 0.
+    text = find_child(frames.children[0], "text");
+    originalContent = text.textContent;
+    text.textContent = "!";
+    bangWidth = text.getComputedTextLength();
+    text.textContent = "W";
+    wWidth = text.getComputedTextLength();
+    text.textContent = originalContent;
+    if (bangWidth === wWidth) {
+        return bangWidth;
+    } else {
+        return 0;
+    }
+}
+function update_text_for_elements(elements) {
+    // In order to render quickly in the browser, you want to do one pass of
+    // reading attributes, and one pass of mutating attributes. See
+    // https://web.dev/avoid-large-complex-layouts-and-layout-thrashing/ for details.
+
+    // Fall back to inefficient calculation, if we're variable-width font.
+    // TODO This should be optimized somehow too.
+    if (known_font_width === 0) {
+        for (var i = 0; i < elements.length; i++) {
+            update_text(elements[i]);
+        }
+        return;
+    }
+
+    var textElemNewAttributes = [];
+    for (var i = 0; i < elements.length; i++) {
+        var e = elements[i];
+        var r = find_child(e, "rect");
+        var t = find_child(e, "text");
+        var w = parseFloat(r.attributes.width.value) * frames.attributes.width.value / 100 - 3;
+        var txt = find_child(e, "title").textContent.replace(/\([^(]*\)$/,"");
+        var newX = format_percent((parseFloat(r.attributes.x.value) + (100 * 3 / frames.attributes.width.value)));
+
+        // Smaller than this size won't fit anything
+        if (w < 2 * known_font_width) {
+            textElemNewAttributes.push([newX, ""]);
+            continue;
+        }
+
+        // Fit in full text width
+        if (txt.length * known_font_width < w) {
+            textElemNewAttributes.push([newX, txt]);
+            continue;
+        }
+
+        var substringLength = Math.floor(w / known_font_width) - 2;
+        if (truncate_text_right) {
+            // Truncate the right side of the text.
+            textElemNewAttributes.push([newX, txt.substring(0, substringLength) + ".."]);
+            continue;
+        } else {
+            // Truncate the left side of the text.
+            textElemNewAttributes.push([newX, ".." + txt.substring(txt.length - substringLength, txt.length)]);
+            continue;
+        }
+    }
+
+    console.assert(textElemNewAttributes.length === elements.length, "Resize failed, please file a bug at https://github.com/jonhoo/inferno/");
+
+    // Now that we know new textContent, set it all in one go so we don't refresh a bazillion times.
+    for (var i = 0; i < elements.length; i++) {
+        var e = elements[i];
+        var values = textElemNewAttributes[i];
+        var t = find_child(e, "text");
+        t.attributes.x.value = values[0];
+        t.textContent = values[1];
+    }
+}
+
+function update_text(e) {
+    var r = find_child(e, "rect");
+    var t = find_child(e, "text");
+    var w = parseFloat(r.attributes.width.value) * frames.attributes.width.value / 100 - 3;
+    var txt = find_child(e, "title").textContent.replace(/\([^(]*\)$/,"");
+    t.attributes.x.value = format_percent((parseFloat(r.attributes.x.value) + (100 * 3 / frames.attributes.width.value)));
+
+    // Smaller than this size won't fit anything
+    if (w < 2 * fontsize * fontwidth) {
+        t.textContent = "";
+        return;
+    }
+    t.textContent = txt;
+    // Fit in full text width
+    if (t.getComputedTextLength() < w)
+        return;
+    if (truncate_text_right) {
+        // Truncate the right side of the text.
+        for (var x = txt.length - 2; x > 0; x--) {
+            if (t.getSubStringLength(0, x + 2) <= w) {
+                t.textContent = txt.substring(0, x) + "..";
+                return;
+            }
+        }
+    } else {
+        // Truncate the left side of the text.
+        for (var x = 2; x < txt.length; x++) {
+            if (t.getSubStringLength(x - 2, txt.length) <= w) {
+                t.textContent = ".." + txt.substring(x, txt.length);
+                return;
+            }
+        }
+    }
+    t.textContent = "";
+}
+// zoom
+function zoom_reset(e) {
+    if (e.tagName == "rect") {
+        e.attributes.x.value = format_percent(100 * parseInt(e.attributes["fg:x"].value) / total_samples);
+        e.attributes.width.value = format_percent(100 * parseInt(e.attributes["fg:w"].value) / total_samples);
+    }
+    if (e.childNodes == undefined) return;
+    for(var i = 0, c = e.childNodes; i < c.length; i++) {
+        zoom_reset(c[i]);
+    }
+}
+function zoom_child(e, x, zoomed_width_samples) {
+    if (e.tagName == "text") {
+        var parent_x = parseFloat(find_child(e.parentNode, "rect[x]").attributes.x.value);
+        e.attributes.x.value = format_percent(parent_x + (100 * 3 / frames.attributes.width.value));
+    } else if (e.tagName == "rect") {
+        e.attributes.x.value = format_percent(100 * (parseInt(e.attributes["fg:x"].value) - x) / zoomed_width_samples);
+        e.attributes.width.value = format_percent(100 * parseInt(e.attributes["fg:w"].value) / zoomed_width_samples);
+    }
+    if (e.childNodes == undefined) return;
+    for(var i = 0, c = e.childNodes; i < c.length; i++) {
+        zoom_child(c[i], x, zoomed_width_samples);
+    }
+}
+function zoom_parent(e) {
+    if (e.attributes) {
+        if (e.attributes.x != undefined) {
+            e.attributes.x.value = "0.0%";
+        }
+        if (e.attributes.width != undefined) {
+            e.attributes.width.value = "100.0%";
+        }
+    }
+    if (e.childNodes == undefined) return;
+    for(var i = 0, c = e.childNodes; i < c.length; i++) {
+        zoom_parent(c[i]);
+    }
+}
+function zoom(node) {
+    var attr = find_child(node, "rect").attributes;
+    var width = parseInt(attr["fg:w"].value);
+    var xmin = parseInt(attr["fg:x"].value);
+    var xmax = xmin + width;
+    var ymin = parseFloat(attr.y.value);
+    unzoombtn.classList.remove("hide");
+    var el = frames.children;
+    var to_update_text = [];
+    for (var i = 0; i < el.length; i++) {
+        var e = el[i];
+        var a = find_child(e, "rect").attributes;
+        var ex = parseInt(a["fg:x"].value);
+        var ew = parseInt(a["fg:w"].value);
+        // Is it an ancestor
+        if (!inverted) {
+            var upstack = parseFloat(a.y.value) > ymin;
+        } else {
+            var upstack = parseFloat(a.y.value) < ymin;
+        }
+        if (upstack) {
+            // Direct ancestor
+            if (ex <= xmin && (ex+ew) >= xmax) {
+                e.classList.add("parent");
+                zoom_parent(e);
+                to_update_text.push(e);
+            }
+            // not in current path
+            else
+                e.classList.add("hide");
+        }
+        // Children maybe
+        else {
+            // no common path
+            if (ex < xmin || ex >= xmax) {
+                e.classList.add("hide");
+            }
+            else {
+                zoom_child(e, xmin, width);
+                to_update_text.push(e);
+            }
+        }
+    }
+    update_text_for_elements(to_update_text);
+}
+function unzoom() {
+    unzoombtn.classList.add("hide");
+    var el = frames.children;
+    for(var i = 0; i < el.length; i++) {
+        el[i].classList.remove("parent");
+        el[i].classList.remove("hide");
+        zoom_reset(el[i]);
+    }
+    update_text_for_elements(el);
+}
+// search
+function reset_search() {
+    var el = document.querySelectorAll("#frames rect");
+    for (var i = 0; i < el.length; i++) {
+        orig_load(el[i], "fill")
+    }
+    var params = get_params();
+    delete params.s;
+    history.replaceState(null, null, parse_params(params));
+}
+function search_prompt() {
+    if (!searching) {
+        var term = prompt("Enter a search term (regexp " +
+            "allowed, eg: ^ext4_)", "");
+        if (term != null) {
+            search(term)
+        }
+    } else {
+        reset_search();
+        searching = 0;
+        searchbtn.classList.remove("show");
+        searchbtn.firstChild.nodeValue = "Search"
+        matchedtxt.classList.add("hide");
+        matchedtxt.firstChild.nodeValue = ""
+    }
+}
+function search(term) {
+    var re = new RegExp(term);
+    var el = frames.children;
+    var matches = new Object();
+    var maxwidth = 0;
+    for (var i = 0; i < el.length; i++) {
+        var e = el[i];
+        // Skip over frames which are either not visible, or below the zoomed-to frame
+        if (e.classList.contains("hide") || e.classList.contains("parent")) {
+            continue;
+        }
+        var func = g_to_func(e);
+        var rect = find_child(e, "rect");
+        if (func == null || rect == null)
+            continue;
+        // Save max width. Only works as we have a root frame
+        var w = parseInt(rect.attributes["fg:w"].value);
+        if (w > maxwidth)
+            maxwidth = w;
+        if (func.match(re)) {
+            // highlight
+            var x = parseInt(rect.attributes["fg:x"].value);
+            orig_save(rect, "fill");
+            rect.attributes.fill.value = searchcolor;
+            // remember matches
+            if (matches[x] == undefined) {
+                matches[x] = w;
+            } else {
+                if (w > matches[x]) {
+                    // overwrite with parent
+                    matches[x] = w;
+                }
+            }
+            searching = 1;
+        }
+    }
+    if (!searching)
+        return;
+    var params = get_params();
+    params.s = term;
+    history.replaceState(null, null, parse_params(params));
+
+    searchbtn.classList.add("show");
+    searchbtn.firstChild.nodeValue = "Reset Search";
+    // calculate percent matched, excluding vertical overlap
+    var count = 0;
+    var lastx = -1;
+    var lastw = 0;
+    var keys = Array();
+    for (k in matches) {
+        if (matches.hasOwnProperty(k))
+            keys.push(k);
+    }
+    // sort the matched frames by their x location
+    // ascending, then width descending
+    keys.sort(function(a, b){
+        return a - b;
+    });
+    // Step through frames saving only the biggest bottom-up frames
+    // thanks to the sort order. This relies on the tree property
+    // where children are always smaller than their parents.
+    for (var k in keys) {
+        var x = parseInt(keys[k]);
+        var w = matches[keys[k]];
+        if (x >= lastx + lastw) {
+            count += w;
+            lastx = x;
+            lastw = w;
+        }
+    }
+    // display matched percent
+    matchedtxt.classList.remove("hide");
+    var pct = 100 * count / maxwidth;
+    if (pct != 100) pct = pct.toFixed(1);
+    matchedtxt.firstChild.nodeValue = "Matched: " + pct + "%";
+}
+function format_percent(n) {
+    return n.toFixed(4) + "%";
+}
+]]></script>
+    <rect x="0" y="0" width="100%" height="2172" fill="url(#background)"/>
+    <text id="title" fill="rgb(0,0,0)" x="50.0000%" y="32.00">Peak Tracked Memory Usage (355.7 MiB), Reversed</text>
+    <text id="subtitle" x="50.0000%" y="64.00">Made with the Fil profiler. <a href="https://pythonspeed.com/fil/" style="text-decoration: underline;" target="_parent">Try it on your code!</a></text>
+    <text id="details" fill="rgb(0,0,0)" x="10" y="84.00"> </text>
+    <text id="unzoom" class="hide" fill="rgb(0,0,0)" x="10" y="32.00">Reset Zoom</text>
+    <text id="search" fill="rgb(0,0,0)" x="1190" y="32.00">Search</text>
+    <text id="matched" fill="rgb(0,0,0)" x="1190" y="2159.00"> </text>
+    <svg id="frames" x="10" width="1180" total_samples="369264356">
+        <g>
+            <title>    result = np.concatenate(to_concat, axis=axis) (8,472,192 bytes, 2.29%)</title>
+            <rect x="0.0053%" y="166" width="2.2943%" height="21" fill="rgb(255,227,227)" fg:x="19512" fg:w="8472192"/>
+            <text x="0.2553%" y="179.50"></text>
+        </g>
+        <g>
+            <title>/home/james-10/.local/share/virtualenvs/data_comparison-yE8TFx91/lib/python3.10/site-packages/pandas/core/dtypes/concat.py:151 (concat_compat) (8,472,192 bytes, 2.29%)</title>
+            <rect x="0.0053%" y="188" width="2.2943%" height="21" fill="rgb(255,227,227)" fg:x="19512" fg:w="8472192"/>
+            <text x="0.2553%" y="201.50"></text>
+        </g>
+        <g>
+            <title>        result = concat_compat(to_concat_vals) (8,472,192 bytes, 2.29%)</title>
+            <rect x="0.0053%" y="210" width="2.2943%" height="21" fill="rgb(255,227,227)" fg:x="19512" fg:w="8472192"/>
+            <text x="0.2553%" y="223.50"></text>
+        </g>
+        <g>
+            <title>/home/james-10/.local/share/virtualenvs/data_comparison-yE8TFx91/lib/python3.10/site-packages/pandas/core/indexes/base.py:5413 (_concat) (8,472,192 bytes, 2.29%)</title>
+            <rect x="0.0053%" y="232" width="2.2943%" height="21" fill="rgb(255,227,227)" fg:x="19512" fg:w="8472192"/>
+            <text x="0.2553%" y="245.50"></text>
+        </g>
+        <g>
+            <title>        return self._concat(to_concat, name) (8,472,192 bytes, 2.29%)</title>
+            <rect x="0.0053%" y="254" width="2.2943%" height="21" fill="rgb(255,227,227)" fg:x="19512" fg:w="8472192"/>
+            <text x="0.2553%" y="267.50"></text>
+        </g>
+        <g>
+            <title>/home/james-10/.local/share/virtualenvs/data_comparison-yE8TFx91/lib/python3.10/site-packages/pandas/core/indexes/base.py:5405 (append) (8,472,192 bytes, 2.29%)</title>
+            <rect x="0.0053%" y="276" width="2.2943%" height="21" fill="rgb(255,227,227)" fg:x="19512" fg:w="8472192"/>
+            <text x="0.2553%" y="289.50"></text>
+        </g>
+        <g>
+            <title>    return indexes[0].append(indexes[1:]) (8,472,192 bytes, 2.29%)</title>
+            <rect x="0.0053%" y="298" width="2.2943%" height="21" fill="rgb(255,227,227)" fg:x="19512" fg:w="8472192"/>
+            <text x="0.2553%" y="311.50"></text>
+        </g>
+        <g>
+            <title>/home/james-10/.local/share/virtualenvs/data_comparison-yE8TFx91/lib/python3.10/site-packages/pandas/core/reshape/concat.py:709 (_concat_indexes) (8,472,192 bytes, 2.29%)</title>
+            <rect x="0.0053%" y="320" width="2.2943%" height="21" fill="rgb(255,227,227)" fg:x="19512" fg:w="8472192"/>
+            <text x="0.2553%" y="333.50"></text>
+        </g>
+        <g>
+            <title>            concat_axis = _concat_indexes(indexes) (8,472,192 bytes, 2.29%)</title>
+            <rect x="0.0053%" y="342" width="2.2943%" height="21" fill="rgb(255,227,227)" fg:x="19512" fg:w="8472192"/>
+            <text x="0.2553%" y="355.50"></text>
+        </g>
+        <g>
+            <title>/home/james-10/.local/share/virtualenvs/data_comparison-yE8TFx91/lib/python3.10/site-packages/pandas/core/reshape/concat.py:691 (_get_concat_axis) (8,472,192 bytes, 2.29%)</title>
+            <rect x="0.0053%" y="364" width="2.2943%" height="21" fill="rgb(255,227,227)" fg:x="19512" fg:w="8472192"/>
+            <text x="0.2553%" y="377.50"></text>
+        </g>
+        <g>
+            <title>            self._get_concat_axis if i == self.bm_axis else self._get_comb_axis(i) (8,472,192 bytes, 2.29%)</title>
+            <rect x="0.0053%" y="386" width="2.2943%" height="21" fill="rgb(255,227,227)" fg:x="19512" fg:w="8472192"/>
+            <text x="0.2553%" y="399.50"></text>
+        </g>
+        <g>
+            <title>/home/james-10/.local/share/virtualenvs/data_comparison-yE8TFx91/lib/python3.10/site-packages/pandas/core/reshape/concat.py:634 (&lt;listcomp&gt;) (8,472,192 bytes, 2.29%)</title>
+            <rect x="0.0053%" y="408" width="2.2943%" height="21" fill="rgb(255,227,227)" fg:x="19512" fg:w="8472192"/>
+            <text x="0.2553%" y="421.50"></text>
+        </g>
+        <g>
+            <title>        return [ (8,472,192 bytes, 2.29%)</title>
+            <rect x="0.0053%" y="430" width="2.2943%" height="21" fill="rgb(255,227,227)" fg:x="19512" fg:w="8472192"/>
+            <text x="0.2553%" y="443.50"></text>
+        </g>
+        <g>
+            <title>/home/james-10/.local/share/virtualenvs/data_comparison-yE8TFx91/lib/python3.10/site-packages/pandas/core/reshape/concat.py:633 (_get_new_axes) (8,472,192 bytes, 2.29%)</title>
+            <rect x="0.0053%" y="452" width="2.2943%" height="21" fill="rgb(255,227,227)" fg:x="19512" fg:w="8472192"/>
+            <text x="0.2553%" y="465.50"></text>
+        </g>
+        <g>
+            <title>        self.new_axes = self._get_new_axes() (8,472,192 bytes, 2.29%)</title>
+            <rect x="0.0053%" y="474" width="2.2943%" height="21" fill="rgb(255,227,227)" fg:x="19512" fg:w="8472192"/>
+            <text x="0.2553%" y="487.50"></text>
+        </g>
+        <g>
+            <title>/home/james-10/.local/share/virtualenvs/data_comparison-yE8TFx91/lib/python3.10/site-packages/pandas/core/reshape/concat.py:563 (__init__) (8,472,192 bytes, 2.29%)</title>
+            <rect x="0.0053%" y="496" width="2.2943%" height="21" fill="rgb(255,227,227)" fg:x="19512" fg:w="8472192"/>
+            <text x="0.2553%" y="509.50"></text>
+        </g>
+        <g>
+            <title>    op = _Concatenator( (8,472,192 bytes, 2.29%)</title>
+            <rect x="0.0053%" y="518" width="2.2943%" height="21" fill="rgb(255,227,227)" fg:x="19512" fg:w="8472192"/>
+            <text x="0.2553%" y="531.50"></text>
+        </g>
+        <g>
+            <title>/home/james-10/.local/share/virtualenvs/data_comparison-yE8TFx91/lib/python3.10/site-packages/pandas/core/reshape/concat.py:368 (concat) (8,472,192 bytes, 2.29%)</title>
+            <rect x="0.0053%" y="540" width="2.2943%" height="21" fill="rgb(255,227,227)" fg:x="19512" fg:w="8472192"/>
+            <text x="0.2553%" y="553.50"></text>
+        </g>
+        <g>
+            <title>            return func(*args, **kwargs) (8,472,192 bytes, 2.29%)</title>
+            <rect x="0.0053%" y="562" width="2.2943%" height="21" fill="rgb(255,227,227)" fg:x="19512" fg:w="8472192"/>
+            <text x="0.2553%" y="575.50"></text>
+        </g>
+        <g>
+            <title>/home/james-10/.local/share/virtualenvs/data_comparison-yE8TFx91/lib/python3.10/site-packages/pandas/util/_decorators.py:331 (wrapper) (8,472,192 bytes, 2.29%)</title>
+            <rect x="0.0053%" y="584" width="2.2943%" height="21" fill="rgb(255,227,227)" fg:x="19512" fg:w="8472192"/>
+            <text x="0.2553%" y="597.50"></text>
+        </g>
+        <g>
+            <title>        chunk_df = pd.concat([chunk_df, df]) (8,472,192 bytes, 2.29%)</title>
+            <rect x="0.0053%" y="606" width="2.2943%" height="21" fill="rgb(255,227,227)" fg:x="19512" fg:w="8472192"/>
+            <text x="0.2553%" y="619.50"></text>
+        </g>
+        <g>
+            <title>main.py:69 (_read_table_to_df_chunking) (8,472,192 bytes, 2.29%)</title>
+            <rect x="0.0053%" y="628" width="2.2943%" height="21" fill="rgb(255,227,227)" fg:x="19512" fg:w="8472192"/>
+            <text x="0.2553%" y="641.50"></text>
+        </g>
+        <g>
+            <title>    df = _read_table_to_df_chunking(PG_URI) (8,472,192 bytes, 2.29%)</title>
+            <rect x="0.0053%" y="650" width="2.2943%" height="21" fill="rgb(255,227,227)" fg:x="19512" fg:w="8472192"/>
+            <text x="0.2553%" y="663.50"></text>
+        </g>
+        <g>
+            <title>main.py:81 (&lt;module&gt;) (8,472,192 bytes, 2.29%)</title>
+            <rect x="0.0053%" y="672" width="2.2943%" height="21" fill="rgb(255,227,227)" fg:x="19512" fg:w="8472192"/>
+            <text x="0.2553%" y="685.50"></text>
+        </g>
+        <g>
+            <title>&lt;__array_function__ internals&gt;:200 (concatenate) (59,304,576 bytes, 16.06%)</title>
+            <rect x="0.0053%" y="144" width="16.0602%" height="21" fill="rgb(255,189,189)" fg:x="19512" fg:w="59304576"/>
+            <text x="0.2553%" y="157.50">&lt;__array_function_..</text>
+        </g>
+        <g>
+            <title>                values = np.concatenate(vals, axis=1) (50,832,384 bytes, 13.77%)</title>
+            <rect x="2.2996%" y="166" width="13.7659%" height="21" fill="rgb(255,194,194)" fg:x="8491704" fg:w="50832384"/>
+            <text x="2.5496%" y="179.50">              ..</text>
+        </g>
+        <g>
+            <title>/home/james-10/.local/share/virtualenvs/data_comparison-yE8TFx91/lib/python3.10/site-packages/pandas/core/internals/concat.py:223 (concatenate_managers) (50,832,384 bytes, 13.77%)</title>
+            <rect x="2.2996%" y="188" width="13.7659%" height="21" fill="rgb(255,194,194)" fg:x="8491704" fg:w="50832384"/>
+            <text x="2.5496%" y="201.50">/home/james-10/..</text>
+        </g>
+        <g>
+            <title>            new_data = concatenate_managers( (50,832,384 bytes, 13.77%)</title>
+            <rect x="2.2996%" y="210" width="13.7659%" height="21" fill="rgb(255,194,194)" fg:x="8491704" fg:w="50832384"/>
+            <text x="2.5496%" y="223.50">            ne..</text>
+        </g>
+        <g>
+            <title>/home/james-10/.local/share/virtualenvs/data_comparison-yE8TFx91/lib/python3.10/site-packages/pandas/core/reshape/concat.py:616 (get_result) (50,832,384 bytes, 13.77%)</title>
+            <rect x="2.2996%" y="232" width="13.7659%" height="21" fill="rgb(255,194,194)" fg:x="8491704" fg:w="50832384"/>
+            <text x="2.5496%" y="245.50">/home/james-10/..</text>
+        </g>
+        <g>
+            <title>    return op.get_result() (50,832,384 bytes, 13.77%)</title>
+            <rect x="2.2996%" y="254" width="13.7659%" height="21" fill="rgb(255,194,194)" fg:x="8491704" fg:w="50832384"/>
+            <text x="2.5496%" y="267.50">    return op...</text>
+        </g>
+        <g>
+            <title>/home/james-10/.local/share/virtualenvs/data_comparison-yE8TFx91/lib/python3.10/site-packages/pandas/core/reshape/concat.py:381 (concat) (50,832,384 bytes, 13.77%)</title>
+            <rect x="2.2996%" y="276" width="13.7659%" height="21" fill="rgb(255,194,194)" fg:x="8491704" fg:w="50832384"/>
+            <text x="2.5496%" y="289.50">/home/james-10/..</text>
+        </g>
+        <g>
+            <title>            return func(*args, **kwargs) (50,832,384 bytes, 13.77%)</title>
+            <rect x="2.2996%" y="298" width="13.7659%" height="21" fill="rgb(255,194,194)" fg:x="8491704" fg:w="50832384"/>
+            <text x="2.5496%" y="311.50">            re..</text>
+        </g>
+        <g>
+            <title>/home/james-10/.local/share/virtualenvs/data_comparison-yE8TFx91/lib/python3.10/site-packages/pandas/util/_decorators.py:331 (wrapper) (50,832,384 bytes, 13.77%)</title>
+            <rect x="2.2996%" y="320" width="13.7659%" height="21" fill="rgb(255,194,194)" fg:x="8491704" fg:w="50832384"/>
+            <text x="2.5496%" y="333.50">/home/james-10/..</text>
+        </g>
+        <g>
+            <title>        chunk_df = pd.concat([chunk_df, df]) (50,832,384 bytes, 13.77%)</title>
+            <rect x="2.2996%" y="342" width="13.7659%" height="21" fill="rgb(255,194,194)" fg:x="8491704" fg:w="50832384"/>
+            <text x="2.5496%" y="355.50">        chunk_..</text>
+        </g>
+        <g>
+            <title>main.py:69 (_read_table_to_df_chunking) (50,832,384 bytes, 13.77%)</title>
+            <rect x="2.2996%" y="364" width="13.7659%" height="21" fill="rgb(255,194,194)" fg:x="8491704" fg:w="50832384"/>
+            <text x="2.5496%" y="377.50">main.py:69 (_re..</text>
+        </g>
+        <g>
+            <title>    df = _read_table_to_df_chunking(PG_URI) (50,832,384 bytes, 13.77%)</title>
+            <rect x="2.2996%" y="386" width="13.7659%" height="21" fill="rgb(255,194,194)" fg:x="8491704" fg:w="50832384"/>
+            <text x="2.5496%" y="399.50">    df = _read..</text>
+        </g>
+        <g>
+            <title>main.py:81 (&lt;module&gt;) (50,832,384 bytes, 13.77%)</title>
+            <rect x="2.2996%" y="408" width="13.7659%" height="21" fill="rgb(255,194,194)" fg:x="8491704" fg:w="50832384"/>
+            <text x="2.5496%" y="421.50">main.py:81 (&lt;mo..</text>
+        </g>
+        <g>
+            <title>&lt;frozen importlib._bootstrap_external&gt;:1176 (create_module) (1,058,673 bytes, 0.29%)</title>
+            <rect x="16.0872%" y="188" width="0.2867%" height="21" fill="rgb(255,241,241)" fg:x="59404329" fg:w="1058673"/>
+            <text x="16.3372%" y="201.50"></text>
+        </g>
+        <g>
+            <title> (1,058,673 bytes, 0.29%)</title>
+            <rect x="16.0872%" y="210" width="0.2867%" height="21" fill="rgb(255,241,241)" fg:x="59404329" fg:w="1058673"/>
+            <text x="16.3372%" y="223.50"></text>
+        </g>
+        <g>
+            <title>&lt;frozen importlib._bootstrap&gt;:571 (module_from_spec) (1,058,673 bytes, 0.29%)</title>
+            <rect x="16.0872%" y="232" width="0.2867%" height="21" fill="rgb(255,241,241)" fg:x="59404329" fg:w="1058673"/>
+            <text x="16.3372%" y="245.50"></text>
+        </g>
+        <g>
+            <title> (1,058,673 bytes, 0.29%)</title>
+            <rect x="16.0872%" y="254" width="0.2867%" height="21" fill="rgb(255,241,241)" fg:x="59404329" fg:w="1058673"/>
+            <text x="16.3372%" y="267.50"></text>
+        </g>
+        <g>
+            <title>&lt;frozen importlib._bootstrap&gt;:674 (_load_unlocked) (1,058,673 bytes, 0.29%)</title>
+            <rect x="16.0872%" y="276" width="0.2867%" height="21" fill="rgb(255,241,241)" fg:x="59404329" fg:w="1058673"/>
+            <text x="16.3372%" y="289.50"></text>
+        </g>
+        <g>
+            <title> (1,058,673 bytes, 0.29%)</title>
+            <rect x="16.0872%" y="298" width="0.2867%" height="21" fill="rgb(255,241,241)" fg:x="59404329" fg:w="1058673"/>
+            <text x="16.3372%" y="311.50"></text>
+        </g>
+        <g>
+            <title>&lt;frozen importlib._bootstrap&gt;:1006 (_find_and_load_unlocked) (1,058,673 bytes, 0.29%)</title>
+            <rect x="16.0872%" y="320" width="0.2867%" height="21" fill="rgb(255,241,241)" fg:x="59404329" fg:w="1058673"/>
+            <text x="16.3372%" y="333.50"></text>
+        </g>
+        <g>
+            <title> (1,058,673 bytes, 0.29%)</title>
+            <rect x="16.0872%" y="342" width="0.2867%" height="21" fill="rgb(255,241,241)" fg:x="59404329" fg:w="1058673"/>
+            <text x="16.3372%" y="355.50"></text>
+        </g>
+        <g>
+            <title>&lt;frozen importlib._bootstrap&gt;:1027 (_find_and_load) (1,058,673 bytes, 0.29%)</title>
+            <rect x="16.0872%" y="364" width="0.2867%" height="21" fill="rgb(255,241,241)" fg:x="59404329" fg:w="1058673"/>
+            <text x="16.3372%" y="377.50"></text>
+        </g>
+        <g>
+            <title> (925,608 bytes, 0.25%)</title>
+            <rect x="16.3739%" y="342" width="0.2507%" height="21" fill="rgb(255,242,242)" fg:x="60463002" fg:w="925608"/>
+            <text x="16.6239%" y="355.50"></text>
+        </g>
+        <g>
+            <title>&lt;frozen importlib._bootstrap&gt;:241 (_call_with_frames_removed) (925,608 bytes, 0.25%)</title>
+            <rect x="16.3739%" y="364" width="0.2507%" height="21" fill="rgb(255,242,242)" fg:x="60463002" fg:w="925608"/>
+            <text x="16.6239%" y="377.50"></text>
+        </g>
+        <g>
+            <title> (925,608 bytes, 0.25%)</title>
+            <rect x="16.3739%" y="386" width="0.2507%" height="21" fill="rgb(255,242,242)" fg:x="60463002" fg:w="925608"/>
+            <text x="16.6239%" y="399.50"></text>
+        </g>
+        <g>
+            <title>&lt;frozen importlib._bootstrap_external&gt;:1184 (exec_module) (1,803,109 bytes, 0.49%)</title>
+            <rect x="16.3739%" y="188" width="0.4883%" height="21" fill="rgb(255,239,239)" fg:x="60463002" fg:w="1803109"/>
+            <text x="16.6239%" y="201.50"></text>
+        </g>
+        <g>
+            <title> (1,803,109 bytes, 0.49%)</title>
+            <rect x="16.3739%" y="210" width="0.4883%" height="21" fill="rgb(255,239,239)" fg:x="60463002" fg:w="1803109"/>
+            <text x="16.6239%" y="223.50"></text>
+        </g>
+        <g>
+            <title>&lt;frozen importlib._bootstrap&gt;:688 (_load_unlocked) (1,803,109 bytes, 0.49%)</title>
+            <rect x="16.3739%" y="232" width="0.4883%" height="21" fill="rgb(255,239,239)" fg:x="60463002" fg:w="1803109"/>
+            <text x="16.6239%" y="245.50"></text>
+        </g>
+        <g>
+            <title> (1,803,109 bytes, 0.49%)</title>
+            <rect x="16.3739%" y="254" width="0.4883%" height="21" fill="rgb(255,239,239)" fg:x="60463002" fg:w="1803109"/>
+            <text x="16.6239%" y="267.50"></text>
+        </g>
+        <g>
+            <title>&lt;frozen importlib._bootstrap&gt;:1006 (_find_and_load_unlocked) (1,803,109 bytes, 0.49%)</title>
+            <rect x="16.3739%" y="276" width="0.4883%" height="21" fill="rgb(255,239,239)" fg:x="60463002" fg:w="1803109"/>
+            <text x="16.6239%" y="289.50"></text>
+        </g>
+        <g>
+            <title> (1,803,109 bytes, 0.49%)</title>
+            <rect x="16.3739%" y="298" width="0.4883%" height="21" fill="rgb(255,239,239)" fg:x="60463002" fg:w="1803109"/>
+            <text x="16.6239%" y="311.50"></text>
+        </g>
+        <g>
+            <title>&lt;frozen importlib._bootstrap&gt;:1027 (_find_and_load) (1,803,109 bytes, 0.49%)</title>
+            <rect x="16.3739%" y="320" width="0.4883%" height="21" fill="rgb(255,239,239)" fg:x="60463002" fg:w="1803109"/>
+            <text x="16.6239%" y="333.50"></text>
+        </g>
+        <g>
+            <title>&lt;frozen importlib._bootstrap&gt;:241 (_call_with_frames_removed) (2,880,538 bytes, 0.78%)</title>
+            <rect x="16.0834%" y="144" width="0.7801%" height="21" fill="rgb(255,236,236)" fg:x="59390255" fg:w="2880538"/>
+            <text x="16.3334%" y="157.50"></text>
+        </g>
+        <g>
+            <title> (2,880,538 bytes, 0.78%)</title>
+            <rect x="16.0834%" y="166" width="0.7801%" height="21" fill="rgb(255,236,236)" fg:x="59390255" fg:w="2880538"/>
+            <text x="16.3334%" y="179.50"></text>
+        </g>
+        <g>
+            <title>&lt;frozen importlib._bootstrap&gt;:1050 (_gcd_import) (1,035,226 bytes, 0.28%)</title>
+            <rect x="16.9548%" y="408" width="0.2803%" height="21" fill="rgb(255,242,242)" fg:x="62608179" fg:w="1035226"/>
+            <text x="17.2048%" y="421.50"></text>
+        </g>
+        <g>
+            <title>    return _bootstrap._gcd_import(name[level:], package, level) (1,035,226 bytes, 0.28%)</title>
+            <rect x="16.9548%" y="430" width="0.2803%" height="21" fill="rgb(255,242,242)" fg:x="62608179" fg:w="1035226"/>
+            <text x="17.2048%" y="443.50"></text>
+        </g>
+        <g>
+            <title>/home/james-10/.pyenv/versions/3.10.8/lib/python3.10/importlib/__init__.py:126 (import_module) (1,035,226 bytes, 0.28%)</title>
+            <rect x="16.9548%" y="452" width="0.2803%" height="21" fill="rgb(255,242,242)" fg:x="62608179" fg:w="1035226"/>
+            <text x="17.2048%" y="465.50"></text>
+        </g>
+        <g>
+            <title>&lt;frozen importlib._bootstrap&gt;:1078 (_handle_fromlist) (2,659,129 bytes, 0.72%)</title>
+            <rect x="17.2352%" y="452" width="0.7201%" height="21" fill="rgb(255,237,237)" fg:x="63643405" fg:w="2659129"/>
+            <text x="17.4852%" y="465.50"></text>
+        </g>
+        <g>
+            <title> (3,821,446 bytes, 1.03%)</title>
+            <rect x="16.9548%" y="386" width="1.0349%" height="21" fill="rgb(255,234,234)" fg:x="62608179" fg:w="3821446"/>
+            <text x="17.2048%" y="399.50"></text>
+        </g>
+        <g>
+            <title>&lt;frozen importlib._bootstrap&gt;:241 (_call_with_frames_removed) (2,786,220 bytes, 0.75%)</title>
+            <rect x="17.2352%" y="408" width="0.7545%" height="21" fill="rgb(255,237,237)" fg:x="63643405" fg:w="2786220"/>
+            <text x="17.4852%" y="421.50"></text>
+        </g>
+        <g>
+            <title> (2,786,220 bytes, 0.75%)</title>
+            <rect x="17.2352%" y="430" width="0.7545%" height="21" fill="rgb(255,237,237)" fg:x="63643405" fg:w="2786220"/>
+            <text x="17.4852%" y="443.50"></text>
+        </g>
+        <g>
+            <title>from .codes import codes (3,884,622 bytes, 1.05%)</title>
+            <rect x="18.1866%" y="386" width="1.0520%" height="21" fill="rgb(255,234,234)" fg:x="67156669" fg:w="3884622"/>
+            <text x="18.4366%" y="399.50"></text>
+        </g>
+        <g>
+            <title>/home/james-10/.local/share/virtualenvs/data_comparison-yE8TFx91/lib/python3.10/site-packages/faker/decode/__init__.py:1 (&lt;module&gt;) (3,884,622 bytes, 1.05%)</title>
+            <rect x="18.1866%" y="408" width="1.0520%" height="21" fill="rgb(255,234,234)" fg:x="67156669" fg:w="3884622"/>
+            <text x="18.4366%" y="421.50"></text>
+        </g>
+        <g>
+            <title> (3,884,622 bytes, 1.05%)</title>
+            <rect x="18.1866%" y="430" width="1.0520%" height="21" fill="rgb(255,234,234)" fg:x="67156669" fg:w="3884622"/>
+            <text x="18.4366%" y="443.50"></text>
+        </g>
+        <g>
+            <title>&lt;frozen importlib._bootstrap&gt;:241 (_call_with_frames_removed) (3,884,622 bytes, 1.05%)</title>
+            <rect x="18.1866%" y="452" width="1.0520%" height="21" fill="rgb(255,234,234)" fg:x="67156669" fg:w="3884622"/>
+            <text x="18.4366%" y="465.50"></text>
+        </g>
+        <g>
+            <title> (3,884,622 bytes, 1.05%)</title>
+            <rect x="18.1866%" y="474" width="1.0520%" height="21" fill="rgb(255,234,234)" fg:x="67156669" fg:w="3884622"/>
+            <text x="18.4366%" y="487.50"></text>
+        </g>
+        <g>
+            <title>&lt;frozen importlib._bootstrap_external&gt;:883 (exec_module) (3,884,622 bytes, 1.05%)</title>
+            <rect x="18.1866%" y="496" width="1.0520%" height="21" fill="rgb(255,234,234)" fg:x="67156669" fg:w="3884622"/>
+            <text x="18.4366%" y="509.50"></text>
+        </g>
+        <g>
+            <title> (3,884,622 bytes, 1.05%)</title>
+            <rect x="18.1866%" y="518" width="1.0520%" height="21" fill="rgb(255,234,234)" fg:x="67156669" fg:w="3884622"/>
+            <text x="18.4366%" y="531.50"></text>
+        </g>
+        <g>
+            <title>&lt;frozen importlib._bootstrap&gt;:688 (_load_unlocked) (3,884,622 bytes, 1.05%)</title>
+            <rect x="18.1866%" y="540" width="1.0520%" height="21" fill="rgb(255,234,234)" fg:x="67156669" fg:w="3884622"/>
+            <text x="18.4366%" y="553.50"></text>
+        </g>
+        <g>
+            <title> (3,884,622 bytes, 1.05%)</title>
+            <rect x="18.1866%" y="562" width="1.0520%" height="21" fill="rgb(255,234,234)" fg:x="67156669" fg:w="3884622"/>
+            <text x="18.4366%" y="575.50"></text>
+        </g>
+        <g>
+            <title>&lt;frozen importlib._bootstrap&gt;:1006 (_find_and_load_unlocked) (3,884,622 bytes, 1.05%)</title>
+            <rect x="18.1866%" y="584" width="1.0520%" height="21" fill="rgb(255,234,234)" fg:x="67156669" fg:w="3884622"/>
+            <text x="18.4366%" y="597.50"></text>
+        </g>
+        <g>
+            <title> (3,884,622 bytes, 1.05%)</title>
+            <rect x="18.1866%" y="606" width="1.0520%" height="21" fill="rgb(255,234,234)" fg:x="67156669" fg:w="3884622"/>
+            <text x="18.4366%" y="619.50"></text>
+        </g>
+        <g>
+            <title>&lt;frozen importlib._bootstrap&gt;:1027 (_find_and_load) (3,884,622 bytes, 1.05%)</title>
+            <rect x="18.1866%" y="628" width="1.0520%" height="21" fill="rgb(255,234,234)" fg:x="67156669" fg:w="3884622"/>
+            <text x="18.4366%" y="641.50"></text>
+        </g>
+        <g>
+            <title>from ...decode import unidecode (3,884,622 bytes, 1.05%)</title>
+            <rect x="18.1866%" y="650" width="1.0520%" height="21" fill="rgb(255,234,234)" fg:x="67156669" fg:w="3884622"/>
+            <text x="18.4366%" y="663.50"></text>
+        </g>
+        <g>
+            <title>/home/james-10/.local/share/virtualenvs/data_comparison-yE8TFx91/lib/python3.10/site-packages/faker/providers/internet/__init__.py:4 (&lt;module&gt;) (3,884,622 bytes, 1.05%)</title>
+            <rect x="18.1866%" y="672" width="1.0520%" height="21" fill="rgb(255,234,234)" fg:x="67156669" fg:w="3884622"/>
+            <text x="18.4366%" y="685.50"></text>
+        </g>
+        <g>
+            <title> (3,884,622 bytes, 1.05%)</title>
+            <rect x="18.1866%" y="694" width="1.0520%" height="21" fill="rgb(255,234,234)" fg:x="67156669" fg:w="3884622"/>
+            <text x="18.4366%" y="707.50"></text>
+        </g>
+        <g>
+            <title>&lt;frozen importlib._bootstrap&gt;:241 (_call_with_frames_removed) (3,884,622 bytes, 1.05%)</title>
+            <rect x="18.1866%" y="716" width="1.0520%" height="21" fill="rgb(255,234,234)" fg:x="67156669" fg:w="3884622"/>
+            <text x="18.4366%" y="729.50"></text>
+        </g>
+        <g>
+            <title> (3,884,622 bytes, 1.05%)</title>
+            <rect x="18.1866%" y="738" width="1.0520%" height="21" fill="rgb(255,234,234)" fg:x="67156669" fg:w="3884622"/>
+            <text x="18.4366%" y="751.50"></text>
+        </g>
+        <g>
+            <title>&lt;frozen importlib._bootstrap_external&gt;:883 (exec_module) (3,884,622 bytes, 1.05%)</title>
+            <rect x="18.1866%" y="760" width="1.0520%" height="21" fill="rgb(255,234,234)" fg:x="67156669" fg:w="3884622"/>
+            <text x="18.4366%" y="773.50"></text>
+        </g>
+        <g>
+            <title> (3,884,622 bytes, 1.05%)</title>
+            <rect x="18.1866%" y="782" width="1.0520%" height="21" fill="rgb(255,234,234)" fg:x="67156669" fg:w="3884622"/>
+            <text x="18.4366%" y="795.50"></text>
+        </g>
+        <g>
+            <title>&lt;frozen importlib._bootstrap&gt;:688 (_load_unlocked) (3,884,622 bytes, 1.05%)</title>
+            <rect x="18.1866%" y="804" width="1.0520%" height="21" fill="rgb(255,234,234)" fg:x="67156669" fg:w="3884622"/>
+            <text x="18.4366%" y="817.50"></text>
+        </g>
+        <g>
+            <title> (3,884,622 bytes, 1.05%)</title>
+            <rect x="18.1866%" y="826" width="1.0520%" height="21" fill="rgb(255,234,234)" fg:x="67156669" fg:w="3884622"/>
+            <text x="18.4366%" y="839.50"></text>
+        </g>
+        <g>
+            <title>&lt;frozen importlib._bootstrap&gt;:1006 (_find_and_load_unlocked) (3,884,622 bytes, 1.05%)</title>
+            <rect x="18.1866%" y="848" width="1.0520%" height="21" fill="rgb(255,234,234)" fg:x="67156669" fg:w="3884622"/>
+            <text x="18.4366%" y="861.50"></text>
+        </g>
+        <g>
+            <title> (3,884,622 bytes, 1.05%)</title>
+            <rect x="18.1866%" y="870" width="1.0520%" height="21" fill="rgb(255,234,234)" fg:x="67156669" fg:w="3884622"/>
+            <text x="18.4366%" y="883.50"></text>
+        </g>
+        <g>
+            <title>&lt;frozen importlib._bootstrap&gt;:1027 (_find_and_load) (3,884,622 bytes, 1.05%)</title>
+            <rect x="18.1866%" y="892" width="1.0520%" height="21" fill="rgb(255,234,234)" fg:x="67156669" fg:w="3884622"/>
+            <text x="18.4366%" y="905.50"></text>
+        </g>
+        <g>
+            <title> (3,884,622 bytes, 1.05%)</title>
+            <rect x="18.1866%" y="914" width="1.0520%" height="21" fill="rgb(255,234,234)" fg:x="67156669" fg:w="3884622"/>
+            <text x="18.4366%" y="927.50"></text>
+        </g>
+        <g>
+            <title>&lt;frozen importlib._bootstrap&gt;:1050 (_gcd_import) (3,884,622 bytes, 1.05%)</title>
+            <rect x="18.1866%" y="936" width="1.0520%" height="21" fill="rgb(255,234,234)" fg:x="67156669" fg:w="3884622"/>
+            <text x="18.4366%" y="949.50"></text>
+        </g>
+        <g>
+            <title>    return _bootstrap._gcd_import(name[level:], package, level) (3,884,622 bytes, 1.05%)</title>
+            <rect x="18.1866%" y="958" width="1.0520%" height="21" fill="rgb(255,234,234)" fg:x="67156669" fg:w="3884622"/>
+            <text x="18.4366%" y="971.50"></text>
+        </g>
+        <g>
+            <title>/home/james-10/.pyenv/versions/3.10.8/lib/python3.10/importlib/__init__.py:126 (import_module) (3,884,622 bytes, 1.05%)</title>
+            <rect x="18.1866%" y="980" width="1.0520%" height="21" fill="rgb(255,234,234)" fg:x="67156669" fg:w="3884622"/>
+            <text x="18.4366%" y="993.50"></text>
+        </g>
+        <g>
+            <title>        provider_module = import_module(provider_path) (3,884,622 bytes, 1.05%)</title>
+            <rect x="18.1866%" y="1002" width="1.0520%" height="21" fill="rgb(255,234,234)" fg:x="67156669" fg:w="3884622"/>
+            <text x="18.4366%" y="1015.50"></text>
+        </g>
+        <g>
+            <title>/home/james-10/.local/share/virtualenvs/data_comparison-yE8TFx91/lib/python3.10/site-packages/faker/utils/loading.py:46 (find_available_locales) (3,884,622 bytes, 1.05%)</title>
+            <rect x="18.1866%" y="1024" width="1.0520%" height="21" fill="rgb(255,234,234)" fg:x="67156669" fg:w="3884622"/>
+            <text x="18.4366%" y="1037.50"></text>
+        </g>
+        <g>
+            <title>AVAILABLE_LOCALES = find_available_locales(PROVIDERS) (3,884,622 bytes, 1.05%)</title>
+            <rect x="18.1866%" y="1046" width="1.0520%" height="21" fill="rgb(255,234,234)" fg:x="67156669" fg:w="3884622"/>
+            <text x="18.4366%" y="1059.50"></text>
+        </g>
+        <g>
+            <title>/home/james-10/.local/share/virtualenvs/data_comparison-yE8TFx91/lib/python3.10/site-packages/faker/config.py:13 (&lt;module&gt;) (3,884,622 bytes, 1.05%)</title>
+            <rect x="18.1866%" y="1068" width="1.0520%" height="21" fill="rgb(255,234,234)" fg:x="67156669" fg:w="3884622"/>
+            <text x="18.4366%" y="1081.50"></text>
+        </g>
+        <g>
+            <title> (3,884,622 bytes, 1.05%)</title>
+            <rect x="18.1866%" y="1090" width="1.0520%" height="21" fill="rgb(255,234,234)" fg:x="67156669" fg:w="3884622"/>
+            <text x="18.4366%" y="1103.50"></text>
+        </g>
+        <g>
+            <title>&lt;frozen importlib._bootstrap&gt;:241 (_call_with_frames_removed) (3,884,622 bytes, 1.05%)</title>
+            <rect x="18.1866%" y="1112" width="1.0520%" height="21" fill="rgb(255,234,234)" fg:x="67156669" fg:w="3884622"/>
+            <text x="18.4366%" y="1125.50"></text>
+        </g>
+        <g>
+            <title> (3,884,622 bytes, 1.05%)</title>
+            <rect x="18.1866%" y="1134" width="1.0520%" height="21" fill="rgb(255,234,234)" fg:x="67156669" fg:w="3884622"/>
+            <text x="18.4366%" y="1147.50"></text>
+        </g>
+        <g>
+            <title>&lt;frozen importlib._bootstrap_external&gt;:883 (exec_module) (3,884,622 bytes, 1.05%)</title>
+            <rect x="18.1866%" y="1156" width="1.0520%" height="21" fill="rgb(255,234,234)" fg:x="67156669" fg:w="3884622"/>
+            <text x="18.4366%" y="1169.50"></text>
+        </g>
+        <g>
+            <title> (3,884,622 bytes, 1.05%)</title>
+            <rect x="18.1866%" y="1178" width="1.0520%" height="21" fill="rgb(255,234,234)" fg:x="67156669" fg:w="3884622"/>
+            <text x="18.4366%" y="1191.50"></text>
+        </g>
+        <g>
+            <title>&lt;frozen importlib._bootstrap&gt;:688 (_load_unlocked) (3,884,622 bytes, 1.05%)</title>
+            <rect x="18.1866%" y="1200" width="1.0520%" height="21" fill="rgb(255,234,234)" fg:x="67156669" fg:w="3884622"/>
+            <text x="18.4366%" y="1213.50"></text>
+        </g>
+        <g>
+            <title> (3,884,622 bytes, 1.05%)</title>
+            <rect x="18.1866%" y="1222" width="1.0520%" height="21" fill="rgb(255,234,234)" fg:x="67156669" fg:w="3884622"/>
+            <text x="18.4366%" y="1235.50"></text>
+        </g>
+        <g>
+            <title>&lt;frozen importlib._bootstrap&gt;:1006 (_find_and_load_unlocked) (3,884,622 bytes, 1.05%)</title>
+            <rect x="18.1866%" y="1244" width="1.0520%" height="21" fill="rgb(255,234,234)" fg:x="67156669" fg:w="3884622"/>
+            <text x="18.4366%" y="1257.50"></text>
+        </g>
+        <g>
+            <title> (3,884,622 bytes, 1.05%)</title>
+            <rect x="18.1866%" y="1266" width="1.0520%" height="21" fill="rgb(255,234,234)" fg:x="67156669" fg:w="3884622"/>
+            <text x="18.4366%" y="1279.50"></text>
+        </g>
+        <g>
+            <title>&lt;frozen importlib._bootstrap&gt;:1027 (_find_and_load) (3,884,622 bytes, 1.05%)</title>
+            <rect x="18.1866%" y="1288" width="1.0520%" height="21" fill="rgb(255,234,234)" fg:x="67156669" fg:w="3884622"/>
+            <text x="18.4366%" y="1301.50"></text>
+        </g>
+        <g>
+            <title>from .config import AVAILABLE_LOCALES, DEFAULT_LOCALE, PROVIDERS (3,884,622 bytes, 1.05%)</title>
+            <rect x="18.1866%" y="1310" width="1.0520%" height="21" fill="rgb(255,234,234)" fg:x="67156669" fg:w="3884622"/>
+            <text x="18.4366%" y="1323.50"></text>
+        </g>
+        <g>
+            <title>/home/james-10/.local/share/virtualenvs/data_comparison-yE8TFx91/lib/python3.10/site-packages/faker/factory.py:8 (&lt;module&gt;) (3,884,622 bytes, 1.05%)</title>
+            <rect x="18.1866%" y="1332" width="1.0520%" height="21" fill="rgb(255,234,234)" fg:x="67156669" fg:w="3884622"/>
+            <text x="18.4366%" y="1345.50"></text>
+        </g>
+        <g>
+            <title> (3,884,622 bytes, 1.05%)</title>
+            <rect x="18.1866%" y="1354" width="1.0520%" height="21" fill="rgb(255,234,234)" fg:x="67156669" fg:w="3884622"/>
+            <text x="18.4366%" y="1367.50"></text>
+        </g>
+        <g>
+            <title>&lt;frozen importlib._bootstrap&gt;:241 (_call_with_frames_removed) (3,884,622 bytes, 1.05%)</title>
+            <rect x="18.1866%" y="1376" width="1.0520%" height="21" fill="rgb(255,234,234)" fg:x="67156669" fg:w="3884622"/>
+            <text x="18.4366%" y="1389.50"></text>
+        </g>
+        <g>
+            <title> (3,884,622 bytes, 1.05%)</title>
+            <rect x="18.1866%" y="1398" width="1.0520%" height="21" fill="rgb(255,234,234)" fg:x="67156669" fg:w="3884622"/>
+            <text x="18.4366%" y="1411.50"></text>
+        </g>
+        <g>
+            <title>&lt;frozen importlib._bootstrap_external&gt;:883 (exec_module) (3,884,622 bytes, 1.05%)</title>
+            <rect x="18.1866%" y="1420" width="1.0520%" height="21" fill="rgb(255,234,234)" fg:x="67156669" fg:w="3884622"/>
+            <text x="18.4366%" y="1433.50"></text>
+        </g>
+        <g>
+            <title> (3,884,622 bytes, 1.05%)</title>
+            <rect x="18.1866%" y="1442" width="1.0520%" height="21" fill="rgb(255,234,234)" fg:x="67156669" fg:w="3884622"/>
+            <text x="18.4366%" y="1455.50"></text>
+        </g>
+        <g>
+            <title>&lt;frozen importlib._bootstrap&gt;:688 (_load_unlocked) (3,884,622 bytes, 1.05%)</title>
+            <rect x="18.1866%" y="1464" width="1.0520%" height="21" fill="rgb(255,234,234)" fg:x="67156669" fg:w="3884622"/>
+            <text x="18.4366%" y="1477.50"></text>
+        </g>
+        <g>
+            <title> (3,884,622 bytes, 1.05%)</title>
+            <rect x="18.1866%" y="1486" width="1.0520%" height="21" fill="rgb(255,234,234)" fg:x="67156669" fg:w="3884622"/>
+            <text x="18.4366%" y="1499.50"></text>
+        </g>
+        <g>
+            <title>&lt;frozen importlib._bootstrap&gt;:1006 (_find_and_load_unlocked) (3,884,622 bytes, 1.05%)</title>
+            <rect x="18.1866%" y="1508" width="1.0520%" height="21" fill="rgb(255,234,234)" fg:x="67156669" fg:w="3884622"/>
+            <text x="18.4366%" y="1521.50"></text>
+        </g>
+        <g>
+            <title> (3,884,622 bytes, 1.05%)</title>
+            <rect x="18.1866%" y="1530" width="1.0520%" height="21" fill="rgb(255,234,234)" fg:x="67156669" fg:w="3884622"/>
+            <text x="18.4366%" y="1543.50"></text>
+        </g>
+        <g>
+            <title>&lt;frozen importlib._bootstrap&gt;:1027 (_find_and_load) (3,884,622 bytes, 1.05%)</title>
+            <rect x="18.1866%" y="1552" width="1.0520%" height="21" fill="rgb(255,234,234)" fg:x="67156669" fg:w="3884622"/>
+            <text x="18.4366%" y="1565.50"></text>
+        </g>
+        <g>
+            <title>from faker.factory import Factory (3,884,622 bytes, 1.05%)</title>
+            <rect x="18.1866%" y="1574" width="1.0520%" height="21" fill="rgb(255,234,234)" fg:x="67156669" fg:w="3884622"/>
+            <text x="18.4366%" y="1587.50"></text>
+        </g>
+        <g>
+            <title>/home/james-10/.local/share/virtualenvs/data_comparison-yE8TFx91/lib/python3.10/site-packages/faker/__init__.py:1 (&lt;module&gt;) (3,884,622 bytes, 1.05%)</title>
+            <rect x="18.1866%" y="1596" width="1.0520%" height="21" fill="rgb(255,234,234)" fg:x="67156669" fg:w="3884622"/>
+            <text x="18.4366%" y="1609.50"></text>
+        </g>
+        <g>
+            <title> (3,884,622 bytes, 1.05%)</title>
+            <rect x="18.1866%" y="1618" width="1.0520%" height="21" fill="rgb(255,234,234)" fg:x="67156669" fg:w="3884622"/>
+            <text x="18.4366%" y="1631.50"></text>
+        </g>
+        <g>
+            <title>&lt;frozen importlib._bootstrap&gt;:241 (_call_with_frames_removed) (3,884,622 bytes, 1.05%)</title>
+            <rect x="18.1866%" y="1640" width="1.0520%" height="21" fill="rgb(255,234,234)" fg:x="67156669" fg:w="3884622"/>
+            <text x="18.4366%" y="1653.50"></text>
+        </g>
+        <g>
+            <title> (3,884,622 bytes, 1.05%)</title>
+            <rect x="18.1866%" y="1662" width="1.0520%" height="21" fill="rgb(255,234,234)" fg:x="67156669" fg:w="3884622"/>
+            <text x="18.4366%" y="1675.50"></text>
+        </g>
+        <g>
+            <title>&lt;frozen importlib._bootstrap_external&gt;:883 (exec_module) (3,884,622 bytes, 1.05%)</title>
+            <rect x="18.1866%" y="1684" width="1.0520%" height="21" fill="rgb(255,234,234)" fg:x="67156669" fg:w="3884622"/>
+            <text x="18.4366%" y="1697.50"></text>
+        </g>
+        <g>
+            <title> (3,884,622 bytes, 1.05%)</title>
+            <rect x="18.1866%" y="1706" width="1.0520%" height="21" fill="rgb(255,234,234)" fg:x="67156669" fg:w="3884622"/>
+            <text x="18.4366%" y="1719.50"></text>
+        </g>
+        <g>
+            <title>&lt;frozen importlib._bootstrap&gt;:688 (_load_unlocked) (3,884,622 bytes, 1.05%)</title>
+            <rect x="18.1866%" y="1728" width="1.0520%" height="21" fill="rgb(255,234,234)" fg:x="67156669" fg:w="3884622"/>
+            <text x="18.4366%" y="1741.50"></text>
+        </g>
+        <g>
+            <title> (3,884,622 bytes, 1.05%)</title>
+            <rect x="18.1866%" y="1750" width="1.0520%" height="21" fill="rgb(255,234,234)" fg:x="67156669" fg:w="3884622"/>
+            <text x="18.4366%" y="1763.50"></text>
+        </g>
+        <g>
+            <title>&lt;frozen importlib._bootstrap&gt;:1006 (_find_and_load_unlocked) (3,884,622 bytes, 1.05%)</title>
+            <rect x="18.1866%" y="1772" width="1.0520%" height="21" fill="rgb(255,234,234)" fg:x="67156669" fg:w="3884622"/>
+            <text x="18.4366%" y="1785.50"></text>
+        </g>
+        <g>
+            <title> (3,884,622 bytes, 1.05%)</title>
+            <rect x="18.1866%" y="1794" width="1.0520%" height="21" fill="rgb(255,234,234)" fg:x="67156669" fg:w="3884622"/>
+            <text x="18.4366%" y="1807.50"></text>
+        </g>
+        <g>
+            <title>&lt;frozen importlib._bootstrap&gt;:1027 (_find_and_load) (3,884,622 bytes, 1.05%)</title>
+            <rect x="18.1866%" y="1816" width="1.0520%" height="21" fill="rgb(255,234,234)" fg:x="67156669" fg:w="3884622"/>
+            <text x="18.4366%" y="1829.50"></text>
+        </g>
+        <g>
+            <title>from faker import Faker (3,884,622 bytes, 1.05%)</title>
+            <rect x="18.1866%" y="1838" width="1.0520%" height="21" fill="rgb(255,234,234)" fg:x="67156669" fg:w="3884622"/>
+            <text x="18.4366%" y="1851.50"></text>
+        </g>
+        <g>
+            <title>/home/james-10/projects/personal_github/data_comparison/utils/get_faker_data.py:2 (&lt;module&gt;) (3,884,622 bytes, 1.05%)</title>
+            <rect x="18.1866%" y="1860" width="1.0520%" height="21" fill="rgb(255,234,234)" fg:x="67156669" fg:w="3884622"/>
+            <text x="18.4366%" y="1873.50"></text>
+        </g>
+        <g>
+            <title> (3,884,622 bytes, 1.05%)</title>
+            <rect x="18.1866%" y="1882" width="1.0520%" height="21" fill="rgb(255,234,234)" fg:x="67156669" fg:w="3884622"/>
+            <text x="18.4366%" y="1895.50"></text>
+        </g>
+        <g>
+            <title>&lt;frozen importlib._bootstrap&gt;:241 (_call_with_frames_removed) (3,884,622 bytes, 1.05%)</title>
+            <rect x="18.1866%" y="1904" width="1.0520%" height="21" fill="rgb(255,234,234)" fg:x="67156669" fg:w="3884622"/>
+            <text x="18.4366%" y="1917.50"></text>
+        </g>
+        <g>
+            <title> (3,884,622 bytes, 1.05%)</title>
+            <rect x="18.1866%" y="1926" width="1.0520%" height="21" fill="rgb(255,234,234)" fg:x="67156669" fg:w="3884622"/>
+            <text x="18.4366%" y="1939.50"></text>
+        </g>
+        <g>
+            <title>&lt;frozen importlib._bootstrap_external&gt;:883 (exec_module) (3,884,622 bytes, 1.05%)</title>
+            <rect x="18.1866%" y="1948" width="1.0520%" height="21" fill="rgb(255,234,234)" fg:x="67156669" fg:w="3884622"/>
+            <text x="18.4366%" y="1961.50"></text>
+        </g>
+        <g>
+            <title> (3,884,622 bytes, 1.05%)</title>
+            <rect x="18.1866%" y="1970" width="1.0520%" height="21" fill="rgb(255,234,234)" fg:x="67156669" fg:w="3884622"/>
+            <text x="18.4366%" y="1983.50"></text>
+        </g>
+        <g>
+            <title>&lt;frozen importlib._bootstrap&gt;:688 (_load_unlocked) (3,884,622 bytes, 1.05%)</title>
+            <rect x="18.1866%" y="1992" width="1.0520%" height="21" fill="rgb(255,234,234)" fg:x="67156669" fg:w="3884622"/>
+            <text x="18.4366%" y="2005.50"></text>
+        </g>
+        <g>
+            <title> (3,884,622 bytes, 1.05%)</title>
+            <rect x="18.1866%" y="2014" width="1.0520%" height="21" fill="rgb(255,234,234)" fg:x="67156669" fg:w="3884622"/>
+            <text x="18.4366%" y="2027.50"></text>
+        </g>
+        <g>
+            <title>&lt;frozen importlib._bootstrap&gt;:1006 (_find_and_load_unlocked) (3,884,622 bytes, 1.05%)</title>
+            <rect x="18.1866%" y="2036" width="1.0520%" height="21" fill="rgb(255,234,234)" fg:x="67156669" fg:w="3884622"/>
+            <text x="18.4366%" y="2049.50"></text>
+        </g>
+        <g>
+            <title> (3,884,622 bytes, 1.05%)</title>
+            <rect x="18.1866%" y="2058" width="1.0520%" height="21" fill="rgb(255,234,234)" fg:x="67156669" fg:w="3884622"/>
+            <text x="18.4366%" y="2071.50"></text>
+        </g>
+        <g>
+            <title>&lt;frozen importlib._bootstrap&gt;:1027 (_find_and_load) (3,884,622 bytes, 1.05%)</title>
+            <rect x="18.1866%" y="2080" width="1.0520%" height="21" fill="rgb(255,234,234)" fg:x="67156669" fg:w="3884622"/>
+            <text x="18.4366%" y="2093.50"></text>
+        </g>
+        <g>
+            <title>from utils.get_faker_data import generate_fake_client_data (3,884,622 bytes, 1.05%)</title>
+            <rect x="18.1866%" y="2102" width="1.0520%" height="21" fill="rgb(255,234,234)" fg:x="67156669" fg:w="3884622"/>
+            <text x="18.4366%" y="2115.50"></text>
+        </g>
+        <g>
+            <title>main.py:4 (&lt;module&gt;) (3,884,622 bytes, 1.05%)</title>
+            <rect x="18.1866%" y="2124" width="1.0520%" height="21" fill="rgb(255,234,234)" fg:x="67156669" fg:w="3884622"/>
+            <text x="18.4366%" y="2137.50"></text>
+        </g>
+        <g>
+            <title>&lt;frozen importlib._bootstrap_external&gt;:672 (_compile_bytecode) (19,896,425 bytes, 5.39%)</title>
+            <rect x="16.9472%" y="144" width="5.3881%" height="21" fill="rgb(255,215,215)" fg:x="62579786" fg:w="19896425"/>
+            <text x="17.1972%" y="157.50">&lt;fro..</text>
+        </g>
+        <g>
+            <title> (19,896,425 bytes, 5.39%)</title>
+            <rect x="16.9472%" y="166" width="5.3881%" height="21" fill="rgb(255,215,215)" fg:x="62579786" fg:w="19896425"/>
+            <text x="17.1972%" y="179.50"></text>
+        </g>
+        <g>
+            <title>&lt;frozen importlib._bootstrap_external&gt;:1012 (get_code) (19,896,425 bytes, 5.39%)</title>
+            <rect x="16.9472%" y="188" width="5.3881%" height="21" fill="rgb(255,215,215)" fg:x="62579786" fg:w="19896425"/>
+            <text x="17.1972%" y="201.50">&lt;fro..</text>
+        </g>
+        <g>
+            <title> (19,896,425 bytes, 5.39%)</title>
+            <rect x="16.9472%" y="210" width="5.3881%" height="21" fill="rgb(255,215,215)" fg:x="62579786" fg:w="19896425"/>
+            <text x="17.1972%" y="223.50"></text>
+        </g>
+        <g>
+            <title>&lt;frozen importlib._bootstrap_external&gt;:879 (exec_module) (19,896,425 bytes, 5.39%)</title>
+            <rect x="16.9472%" y="232" width="5.3881%" height="21" fill="rgb(255,215,215)" fg:x="62579786" fg:w="19896425"/>
+            <text x="17.1972%" y="245.50">&lt;fro..</text>
+        </g>
+        <g>
+            <title> (19,896,425 bytes, 5.39%)</title>
+            <rect x="16.9472%" y="254" width="5.3881%" height="21" fill="rgb(255,215,215)" fg:x="62579786" fg:w="19896425"/>
+            <text x="17.1972%" y="267.50"></text>
+        </g>
+        <g>
+            <title>&lt;frozen importlib._bootstrap&gt;:688 (_load_unlocked) (19,896,425 bytes, 5.39%)</title>
+            <rect x="16.9472%" y="276" width="5.3881%" height="21" fill="rgb(255,215,215)" fg:x="62579786" fg:w="19896425"/>
+            <text x="17.1972%" y="289.50">&lt;fro..</text>
+        </g>
+        <g>
+            <title> (19,896,425 bytes, 5.39%)</title>
+            <rect x="16.9472%" y="298" width="5.3881%" height="21" fill="rgb(255,215,215)" fg:x="62579786" fg:w="19896425"/>
+            <text x="17.1972%" y="311.50"></text>
+        </g>
+        <g>
+            <title>&lt;frozen importlib._bootstrap&gt;:1006 (_find_and_load_unlocked) (19,896,425 bytes, 5.39%)</title>
+            <rect x="16.9472%" y="320" width="5.3881%" height="21" fill="rgb(255,215,215)" fg:x="62579786" fg:w="19896425"/>
+            <text x="17.1972%" y="333.50">&lt;fro..</text>
+        </g>
+        <g>
+            <title> (19,896,425 bytes, 5.39%)</title>
+            <rect x="16.9472%" y="342" width="5.3881%" height="21" fill="rgb(255,215,215)" fg:x="62579786" fg:w="19896425"/>
+            <text x="17.1972%" y="355.50"></text>
+        </g>
+        <g>
+            <title>&lt;frozen importlib._bootstrap&gt;:1027 (_find_and_load) (19,896,425 bytes, 5.39%)</title>
+            <rect x="16.9472%" y="364" width="5.3881%" height="21" fill="rgb(255,215,215)" fg:x="62579786" fg:w="19896425"/>
+            <text x="17.1972%" y="377.50">&lt;fro..</text>
+        </g>
+        <g>
+            <title> (82,494,837 bytes, 22.34%)</title>
+            <rect x="0.0010%" y="122" width="22.3403%" height="21" fill="rgb(255,179,179)" fg:x="3566" fg:w="82494837"/>
+            <text x="0.2510%" y="135.50"></text>
+        </g>
+        <g>
+            <title>        cursor.execute(statement, parameters) (122,160,082 bytes, 33.08%)</title>
+            <rect x="24.3178%" y="122" width="33.0820%" height="21" fill="rgb(255,163,163)" fg:x="89797037" fg:w="122160082"/>
+            <text x="24.5678%" y="135.50">        cursor.execute(statement, param..</text>
+        </g>
+        <g>
+            <title>/home/james-10/.local/share/virtualenvs/data_comparison-yE8TFx91/lib/python3.10/site-packages/sqlalchemy/engine/default.py:736 (do_execute) (122,160,082 bytes, 33.08%)</title>
+            <rect x="24.3178%" y="144" width="33.0820%" height="21" fill="rgb(255,163,163)" fg:x="89797037" fg:w="122160082"/>
+            <text x="24.5678%" y="157.50">/home/james-10/.local/share/virtualenvs/..</text>
+        </g>
+        <g>
+            <title>                    self.dialect.do_execute( (122,160,082 bytes, 33.08%)</title>
+            <rect x="24.3178%" y="166" width="33.0820%" height="21" fill="rgb(255,163,163)" fg:x="89797037" fg:w="122160082"/>
+            <text x="24.5678%" y="179.50">                    self.dialect.do_exe..</text>
+        </g>
+        <g>
+            <title>/home/james-10/.local/share/virtualenvs/data_comparison-yE8TFx91/lib/python3.10/site-packages/sqlalchemy/engine/base.py:1900 (_execute_context) (122,160,082 bytes, 33.08%)</title>
+            <rect x="24.3178%" y="188" width="33.0820%" height="21" fill="rgb(255,163,163)" fg:x="89797037" fg:w="122160082"/>
+            <text x="24.5678%" y="201.50">/home/james-10/.local/share/virtualenvs/..</text>
+        </g>
+        <g>
+            <title>        ret = self._execute_context( (122,160,082 bytes, 33.08%)</title>
+            <rect x="24.3178%" y="210" width="33.0820%" height="21" fill="rgb(255,163,163)" fg:x="89797037" fg:w="122160082"/>
+            <text x="24.5678%" y="223.50">        ret = self._execute_context(..</text>
+        </g>
+        <g>
+            <title>/home/james-10/.local/share/virtualenvs/data_comparison-yE8TFx91/lib/python3.10/site-packages/sqlalchemy/engine/base.py:1669 (_exec_driver_sql) (122,160,082 bytes, 33.08%)</title>
+            <rect x="24.3178%" y="232" width="33.0820%" height="21" fill="rgb(255,163,163)" fg:x="89797037" fg:w="122160082"/>
+            <text x="24.5678%" y="245.50">/home/james-10/.local/share/virtualenvs/..</text>
+        </g>
+        <g>
+            <title>            return self._exec_driver_sql( (122,160,082 bytes, 33.08%)</title>
+            <rect x="24.3178%" y="254" width="33.0820%" height="21" fill="rgb(255,163,163)" fg:x="89797037" fg:w="122160082"/>
+            <text x="24.5678%" y="267.50">            return self._exec_driver_sq..</text>
+        </g>
+        <g>
+            <title>/home/james-10/.local/share/virtualenvs/data_comparison-yE8TFx91/lib/python3.10/site-packages/sqlalchemy/engine/base.py:1365 (execute) (122,160,082 bytes, 33.08%)</title>
+            <rect x="24.3178%" y="276" width="33.0820%" height="21" fill="rgb(255,163,163)" fg:x="89797037" fg:w="122160082"/>
+            <text x="24.5678%" y="289.50">/home/james-10/.local/share/virtualenvs/..</text>
+        </g>
+        <g>
+            <title>        return connection.execute(statement, *multiparams, **params) (122,160,082 bytes, 33.08%)</title>
+            <rect x="24.3178%" y="298" width="33.0820%" height="21" fill="rgb(255,163,163)" fg:x="89797037" fg:w="122160082"/>
+            <text x="24.5678%" y="311.50">        return connection.execute(state..</text>
+        </g>
+        <g>
+            <title>/home/james-10/.local/share/virtualenvs/data_comparison-yE8TFx91/lib/python3.10/site-packages/sqlalchemy/engine/base.py:3257 (execute) (122,160,082 bytes, 33.08%)</title>
+            <rect x="24.3178%" y="320" width="33.0820%" height="21" fill="rgb(255,163,163)" fg:x="89797037" fg:w="122160082"/>
+            <text x="24.5678%" y="333.50">/home/james-10/.local/share/virtualenvs/..</text>
+        </g>
+        <g>
+            <title>        return fn(*args, **kwargs) (122,160,082 bytes, 33.08%)</title>
+            <rect x="24.3178%" y="342" width="33.0820%" height="21" fill="rgb(255,163,163)" fg:x="89797037" fg:w="122160082"/>
+            <text x="24.5678%" y="355.50">        return fn(*args, **kwargs)..</text>
+        </g>
+        <g>
+            <title>/home/james-10/.local/share/virtualenvs/data_comparison-yE8TFx91/lib/python3.10/site-packages/sqlalchemy/util/deprecations.py:468 (warned) (122,160,082 bytes, 33.08%)</title>
+            <rect x="24.3178%" y="364" width="33.0820%" height="21" fill="rgb(255,163,163)" fg:x="89797037" fg:w="122160082"/>
+            <text x="24.5678%" y="377.50">/home/james-10/.local/share/virtualenvs/..</text>
+        </g>
+        <g>
+            <title> (122,160,082 bytes, 33.08%)</title>
+            <rect x="24.3178%" y="386" width="33.0820%" height="21" fill="rgb(255,163,163)" fg:x="89797037" fg:w="122160082"/>
+            <text x="24.5678%" y="399.50"></text>
+        </g>
+        <g>
+            <title>&lt;string&gt;:2 (execute) (122,160,082 bytes, 33.08%)</title>
+            <rect x="24.3178%" y="408" width="33.0820%" height="21" fill="rgb(255,163,163)" fg:x="89797037" fg:w="122160082"/>
+            <text x="24.5678%" y="421.50">&lt;string&gt;:2 (execute)</text>
+        </g>
+        <g>
+            <title>        return self.connectable.execution_options().execute(*args, **kwargs) (122,160,082 bytes, 33.08%)</title>
+            <rect x="24.3178%" y="430" width="33.0820%" height="21" fill="rgb(255,163,163)" fg:x="89797037" fg:w="122160082"/>
+            <text x="24.5678%" y="443.50">        return self.connectable.executi..</text>
+        </g>
+        <g>
+            <title>/home/james-10/.local/share/virtualenvs/data_comparison-yE8TFx91/lib/python3.10/site-packages/pandas/io/sql.py:1405 (execute) (122,160,082 bytes, 33.08%)</title>
+            <rect x="24.3178%" y="452" width="33.0820%" height="21" fill="rgb(255,163,163)" fg:x="89797037" fg:w="122160082"/>
+            <text x="24.5678%" y="465.50">/home/james-10/.local/share/virtualenvs/..</text>
+        </g>
+        <g>
+            <title>        result = self.execute(*args) (122,160,082 bytes, 33.08%)</title>
+            <rect x="24.3178%" y="474" width="33.0820%" height="21" fill="rgb(255,163,163)" fg:x="89797037" fg:w="122160082"/>
+            <text x="24.5678%" y="487.50">        result = self.execute(*args)..</text>
+        </g>
+        <g>
+            <title>/home/james-10/.local/share/virtualenvs/data_comparison-yE8TFx91/lib/python3.10/site-packages/pandas/io/sql.py:1560 (read_query) (122,160,082 bytes, 33.08%)</title>
+            <rect x="24.3178%" y="496" width="33.0820%" height="21" fill="rgb(255,163,163)" fg:x="89797037" fg:w="122160082"/>
+            <text x="24.5678%" y="509.50">/home/james-10/.local/share/virtualenvs/..</text>
+        </g>
+        <g>
+            <title>    return pandas_sql.read_query( (122,160,082 bytes, 33.08%)</title>
+            <rect x="24.3178%" y="518" width="33.0820%" height="21" fill="rgb(255,163,163)" fg:x="89797037" fg:w="122160082"/>
+            <text x="24.5678%" y="531.50">    return pandas_sql.read_query(..</text>
+        </g>
+        <g>
+            <title>/home/james-10/.local/share/virtualenvs/data_comparison-yE8TFx91/lib/python3.10/site-packages/pandas/io/sql.py:397 (read_sql_query) (122,160,082 bytes, 33.08%)</title>
+            <rect x="24.3178%" y="540" width="33.0820%" height="21" fill="rgb(255,163,163)" fg:x="89797037" fg:w="122160082"/>
+            <text x="24.5678%" y="553.50">/home/james-10/.local/share/virtualenvs/..</text>
+        </g>
+        <g>
+            <title>    for df in pd.read_sql_query(query, conn, chunksize=1000): (122,160,082 bytes, 33.08%)</title>
+            <rect x="24.3178%" y="562" width="33.0820%" height="21" fill="rgb(255,163,163)" fg:x="89797037" fg:w="122160082"/>
+            <text x="24.5678%" y="575.50">    for df in pd.read_sql_query(query, ..</text>
+        </g>
+        <g>
+            <title>main.py:68 (_read_table_to_df_chunking) (122,160,082 bytes, 33.08%)</title>
+            <rect x="24.3178%" y="584" width="33.0820%" height="21" fill="rgb(255,163,163)" fg:x="89797037" fg:w="122160082"/>
+            <text x="24.5678%" y="597.50">main.py:68 (_read_table_to_df_chunking)</text>
+        </g>
+        <g>
+            <title>    df = _read_table_to_df_chunking(PG_URI) (122,160,082 bytes, 33.08%)</title>
+            <rect x="24.3178%" y="606" width="33.0820%" height="21" fill="rgb(255,163,163)" fg:x="89797037" fg:w="122160082"/>
+            <text x="24.5678%" y="619.50">    df = _read_table_to_df_chunking(PG_..</text>
+        </g>
+        <g>
+            <title>main.py:81 (&lt;module&gt;) (122,160,082 bytes, 33.08%)</title>
+            <rect x="24.3178%" y="628" width="33.0820%" height="21" fill="rgb(255,163,163)" fg:x="89797037" fg:w="122160082"/>
+            <text x="24.5678%" y="641.50">main.py:81 (&lt;module&gt;)</text>
+        </g>
+        <g>
+            <title>                l = dbapi_cursor.fetchmany(size) (154,321,567 bytes, 41.79%)</title>
+            <rect x="58.0837%" y="122" width="41.7916%" height="21" fill="rgb(255,153,153)" fg:x="214482340" fg:w="154321567"/>
+            <text x="58.3337%" y="135.50">                l = dbapi_cursor.fetchmany(size)..</text>
+        </g>
+        <g>
+            <title>/home/james-10/.local/share/virtualenvs/data_comparison-yE8TFx91/lib/python3.10/site-packages/sqlalchemy/engine/cursor.py:981 (fetchmany) (154,321,567 bytes, 41.79%)</title>
+            <rect x="58.0837%" y="144" width="41.7916%" height="21" fill="rgb(255,153,153)" fg:x="214482340" fg:w="154321567"/>
+            <text x="58.3337%" y="157.50">/home/james-10/.local/share/virtualenvs/data_compar..</text>
+        </g>
+        <g>
+            <title>        return self.cursor_strategy.fetchmany(self, self.cursor, size) (154,321,567 bytes, 41.79%)</title>
+            <rect x="58.0837%" y="166" width="41.7916%" height="21" fill="rgb(255,153,153)" fg:x="214482340" fg:w="154321567"/>
+            <text x="58.3337%" y="179.50">        return self.cursor_strategy.fetchmany(self..</text>
+        </g>
+        <g>
+            <title>/home/james-10/.local/share/virtualenvs/data_comparison-yE8TFx91/lib/python3.10/site-packages/sqlalchemy/engine/cursor.py:1822 (_fetchmany_impl) (154,321,567 bytes, 41.79%)</title>
+            <rect x="58.0837%" y="188" width="41.7916%" height="21" fill="rgb(255,153,153)" fg:x="214482340" fg:w="154321567"/>
+            <text x="58.3337%" y="201.50">/home/james-10/.local/share/virtualenvs/data_compar..</text>
+        </g>
+        <g>
+            <title>                rows = self._fetchmany_impl(num) (154,321,567 bytes, 41.79%)</title>
+            <rect x="58.0837%" y="210" width="41.7916%" height="21" fill="rgb(255,153,153)" fg:x="214482340" fg:w="154321567"/>
+            <text x="58.3337%" y="223.50">                rows = self._fetchmany_impl(num)..</text>
+        </g>
+        <g>
+            <title>/home/james-10/.local/share/virtualenvs/data_comparison-yE8TFx91/lib/python3.10/site-packages/sqlalchemy/engine/result.py:542 (manyrows) (154,321,567 bytes, 41.79%)</title>
+            <rect x="58.0837%" y="232" width="41.7916%" height="21" fill="rgb(255,153,153)" fg:x="214482340" fg:w="154321567"/>
+            <text x="58.3337%" y="245.50">/home/james-10/.local/share/virtualenvs/data_compar..</text>
+        </g>
+        <g>
+            <title>        return self._manyrow_getter(self, size) (154,321,567 bytes, 41.79%)</title>
+            <rect x="58.0837%" y="254" width="41.7916%" height="21" fill="rgb(255,153,153)" fg:x="214482340" fg:w="154321567"/>
+            <text x="58.3337%" y="267.50">        return self._manyrow_getter(self, size)..</text>
+        </g>
+        <g>
+            <title>/home/james-10/.local/share/virtualenvs/data_comparison-yE8TFx91/lib/python3.10/site-packages/sqlalchemy/engine/result.py:1115 (fetchmany) (154,321,567 bytes, 41.79%)</title>
+            <rect x="58.0837%" y="276" width="41.7916%" height="21" fill="rgb(255,153,153)" fg:x="214482340" fg:w="154321567"/>
+            <text x="58.3337%" y="289.50">/home/james-10/.local/share/virtualenvs/data_compar..</text>
+        </g>
+        <g>
+            <title>            data = result.fetchmany(chunksize) (154,321,567 bytes, 41.79%)</title>
+            <rect x="58.0837%" y="298" width="41.7916%" height="21" fill="rgb(255,153,153)" fg:x="214482340" fg:w="154321567"/>
+            <text x="58.3337%" y="311.50">            data = result.fetchmany(chunksize)..</text>
+        </g>
+        <g>
+            <title>/home/james-10/.local/share/virtualenvs/data_comparison-yE8TFx91/lib/python3.10/site-packages/pandas/io/sql.py:1480 (_query_iterator) (154,321,567 bytes, 41.79%)</title>
+            <rect x="58.0837%" y="320" width="41.7916%" height="21" fill="rgb(255,153,153)" fg:x="214482340" fg:w="154321567"/>
+            <text x="58.3337%" y="333.50">/home/james-10/.local/share/virtualenvs/data_compar..</text>
+        </g>
+        <g>
+            <title>    for df in pd.read_sql_query(query, conn, chunksize=1000): (154,321,567 bytes, 41.79%)</title>
+            <rect x="58.0837%" y="342" width="41.7916%" height="21" fill="rgb(255,153,153)" fg:x="214482340" fg:w="154321567"/>
+            <text x="58.3337%" y="355.50">    for df in pd.read_sql_query(query, conn, chunk..</text>
+        </g>
+        <g>
+            <title>main.py:68 (_read_table_to_df_chunking) (154,321,567 bytes, 41.79%)</title>
+            <rect x="58.0837%" y="364" width="41.7916%" height="21" fill="rgb(255,153,153)" fg:x="214482340" fg:w="154321567"/>
+            <text x="58.3337%" y="377.50">main.py:68 (_read_table_to_df_chunking)</text>
+        </g>
+        <g>
+            <title>    df = _read_table_to_df_chunking(PG_URI) (154,321,567 bytes, 41.79%)</title>
+            <rect x="58.0837%" y="386" width="41.7916%" height="21" fill="rgb(255,153,153)" fg:x="214482340" fg:w="154321567"/>
+            <text x="58.3337%" y="399.50">    df = _read_table_to_df_chunking(PG_URI)..</text>
+        </g>
+        <g>
+            <title>main.py:81 (&lt;module&gt;) (154,321,567 bytes, 41.79%)</title>
+            <rect x="58.0837%" y="408" width="41.7916%" height="21" fill="rgb(255,153,153)" fg:x="214482340" fg:w="154321567"/>
+            <text x="58.3337%" y="421.50">main.py:81 (&lt;module&gt;)</text>
+        </g>
+        <g>
+            <title>all (369,264,356 bytes, 100%)</title>
+            <rect x="0.0000%" y="100" width="100.0000%" height="21" fill="rgb(255,100,100)" fg:x="0" fg:w="369264356"/>
+            <text x="0.2500%" y="113.50"></text>
+        </g>
+    </svg>
+</svg>
